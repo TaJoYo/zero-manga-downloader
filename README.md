@@ -24,6 +24,10 @@ cd zero-manga-downloader
 
 ### 2. 安装依赖
 
+**Windows用户（推荐）：**
+- 双击 `install_requirements.bat` 自动安装依赖
+
+**或使用命令行：**
 ```bash
 pip install -r requirements.txt
 ```
@@ -93,6 +97,7 @@ zero-manga-downloader/
 ├── downloader.py              # 下载器核心
 ├── config_manager.py          # 配置管理
 ├── history_manager.py         # 历史记录管理
+├── install_requirements.bat    # 依赖安装脚本（首次运行）
 ├── 启动下载器_Fluent.bat      # Windows启动脚本
 ├── requirements.txt           # 依赖包列表
 ├── 使用指南.md               # 详细使用教程
