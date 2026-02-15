@@ -40,8 +40,12 @@ pip install -r requirements.txt
 
 ### GUI版本
 
-运行GUI程序：
+运行GUI程序，有两种方式：
 
+**方式1：双击启动脚本（推荐）**
+- Windows用户可直接双击 `启动下载器_Fluent.bat` 文件启动
+
+**方式2：命令行启动**
 ```bash
 python gui_downloader_fluent.py
 ```
