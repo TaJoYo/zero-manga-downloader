@@ -38,29 +38,6 @@ pip install -r requirements.txt
 
 ## 🎮 使用方法
 
-### Web版本（推荐） ⭐
-
-**最现代化、最好用的方式！**
-
-运行Web服务器：
-
-```bash
-python gui_downloader_fluent.py
-```
-
-或者双击 `启动下载器_Fluent.bat`（Windows）
-
-程序启动后会显示GUI界面。
-
-**功能：**
-
-- 💫 Fluent Design风格，界面现代简洁
-- 支持实时进度显示
-- 智能章节选择（全选、清除、部分选择）
-- 灵活的线程调整
-- 下载历史记录
-- 配置管理
-
 ### GUI版本
 
 运行GUI程序：
