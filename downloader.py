@@ -5,18 +5,36 @@
 """
 
 import os
+import random
+import re
+import shutil
 import time
 import requests
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import List, Dict, Callable, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from PIL import Image
+
+
+def sanitize_filename(filename: str) -> str:
+    """清理文件名，移除非法字符"""
+    if not filename:
+        return ""
+
+    cleaned = re.sub(r'[<>:"/\\|?*]', '_', filename).strip()
+    if len(cleaned) > 200:
+        cleaned = cleaned[:200]
+    return cleaned
 
 
 class MangaDownloader:
     """漫画下载器"""
     
     def __init__(self, threads: int = 15, retries: int = 3, 
-                 retry_delay: int = 2, timeout: int = 15):
+                 retry_delay: int = 2, timeout: int = 15,
+                 verify_images: bool = True):
         """
         初始化下载器
         
@@ -25,11 +43,13 @@ class MangaDownloader:
             retries: 重试次数
             retry_delay: 重试延迟(秒)
             timeout: 请求超时(秒)
+            verify_images: 是否严格校验已存在/已下载图片
         """
         self.threads = threads
         self.retries = retries
         self.retry_delay = retry_delay
         self.timeout = timeout
+        self.verify_images = verify_images
         
         self.session = requests.Session()
         self.session.headers.update({
@@ -48,6 +68,121 @@ class MangaDownloader:
         
         # 是否取消下载
         self.cancelled = False
+
+    def _emit_progress(self, progress_callback: Callable, status: str,
+                      url: str, save_path: str = '', detail: str = ''):
+        """统一发送进度回调"""
+        if progress_callback:
+            progress_callback(status, url, save_path, detail)
+
+    def _cleanup_partial_file(self, part_path: str):
+        """删除临时文件"""
+        try:
+            if os.path.exists(part_path):
+                os.remove(part_path)
+        except OSError:
+            pass
+
+    def _finalize_download_file(self, part_path: str, save_path: str):
+        """将临时文件提交为最终文件，优先原子替换"""
+        try:
+            os.replace(part_path, save_path)
+            return
+        except PermissionError:
+            # 某些受限环境会拦截 rename，回退到复制后删除
+            pass
+
+        with open(part_path, 'rb') as src, open(save_path, 'wb') as dst:
+            shutil.copyfileobj(src, dst)
+        self._cleanup_partial_file(part_path)
+
+    def _is_image_valid(self, image_path: str) -> bool:
+        """检查图片文件是否可读"""
+        try:
+            if not os.path.exists(image_path):
+                return False
+            if os.path.getsize(image_path) <= 0:
+                return False
+
+            with Image.open(image_path) as img:
+                img.verify()
+            return True
+        except Exception:
+            return False
+
+    def _is_existing_file_usable(self, save_path: str) -> bool:
+        """检查已存在文件是否可复用"""
+        if not os.path.exists(save_path):
+            return False
+
+        try:
+            file_size = os.path.getsize(save_path)
+        except OSError:
+            return False
+
+        if file_size <= 0:
+            return False
+
+        # 轻量模式：仅校验文件大小
+        if not self.verify_images:
+            return True
+
+        # 严格模式：校验图片可读性
+        if self._is_image_valid(save_path):
+            return True
+
+        # 校验失败视为损坏文件，删除后重下
+        try:
+            os.remove(save_path)
+        except OSError:
+            pass
+        return False
+
+    def _parse_retry_after(self, retry_after: str) -> Optional[float]:
+        """解析 Retry-After 头"""
+        if not retry_after:
+            return None
+
+        retry_after = retry_after.strip()
+        if not retry_after:
+            return None
+
+        # 秒数格式
+        try:
+            return max(0.0, float(retry_after))
+        except ValueError:
+            pass
+
+        # HTTP 日期格式
+        try:
+            target_time = parsedate_to_datetime(retry_after)
+            if target_time.tzinfo is None:
+                target_time = target_time.replace(tzinfo=timezone.utc)
+            seconds = (target_time - datetime.now(timezone.utc)).total_seconds()
+            return max(0.0, seconds)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    def _calc_backoff_delay(self, attempt: int, status_code: Optional[int] = None,
+                           retry_after: Optional[str] = None) -> float:
+        """根据状态码计算重试等待时间"""
+        jitter = random.uniform(0.0, 1.0)
+        base_delay = self.retry_delay * (2 ** attempt)
+
+        if status_code == 429:
+            retry_after_seconds = self._parse_retry_after(retry_after or '')
+            if retry_after_seconds is not None:
+                return retry_after_seconds + jitter
+            return base_delay + jitter
+
+        if status_code == 403:
+            # 403 更保守，避免高频重试
+            return max(base_delay * 2, self.retry_delay + 3) + jitter
+
+        if status_code is not None and 500 <= status_code < 600:
+            return base_delay + jitter
+
+        return base_delay + jitter
     
     def download_image(self, url: str, save_path: str, 
                       progress_callback: Callable = None) -> str:
@@ -60,56 +195,157 @@ class MangaDownloader:
             progress_callback: 进度回调函数
         
         Returns:
-            状态字符串: 'skipped'/'success'/'failed'/'error'
+            状态字符串: 'skipped'/'success'/'failed'/'error'/'cancelled'
         """
         # 检查是否取消
         if self.cancelled:
-            return 'failed'
+            self._emit_progress(progress_callback, 'cancelled', url, save_path, '下载已取消')
+            return 'cancelled'
         
-        # 如果文件已存在且大小>0，跳过
-        if os.path.exists(save_path) and os.path.getsize(save_path) > 0:
-            if progress_callback:
-                progress_callback('skipped', url, save_path)
+        # 文件完整则跳过
+        if self._is_existing_file_usable(save_path):
+            self._emit_progress(progress_callback, 'skipped', url, save_path)
             return 'skipped'
-        
-        for attempt in range(self.retries):
+
+        part_path = f"{save_path}.part"
+        self._cleanup_partial_file(part_path)
+
+        for attempt in range(max(1, self.retries)):
             if self.cancelled:
-                return 'failed'
+                self._cleanup_partial_file(part_path)
+                self._emit_progress(progress_callback, 'cancelled', url, save_path, '下载已取消')
+                return 'cancelled'
             
             try:
-                response = self.session.get(url, timeout=self.timeout, stream=True)
-                
-                if response.status_code == 200:
-                    # 确保目录存在
-                    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-                    
-                    # 直接写入文件
-                    with open(save_path, 'wb') as f:
-                        for chunk in response.iter_content(chunk_size=8192):
-                            if self.cancelled:
-                                return 'failed'
-                            if chunk:
-                                f.write(chunk)
-                    
-                    if progress_callback:
-                        progress_callback('success', url, save_path)
-                    return 'success'
-                
-                elif response.status_code == 404:
-                    # 404不重试
-                    if progress_callback:
-                        progress_callback('not_found', url, save_path)
+                with self.session.get(url, timeout=self.timeout, stream=True) as response:
+                    status_code = response.status_code
+
+                    if status_code == 200:
+                        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+
+                        with open(part_path, 'wb') as tmp_file:
+                            for chunk in response.iter_content(chunk_size=8192):
+                                if self.cancelled:
+                                    self._cleanup_partial_file(part_path)
+                                    self._emit_progress(
+                                        progress_callback,
+                                        'cancelled',
+                                        url,
+                                        save_path,
+                                        '下载已取消'
+                                    )
+                                    return 'cancelled'
+                                if chunk:
+                                    tmp_file.write(chunk)
+
+                        if os.path.getsize(part_path) <= 0:
+                            raise IOError("下载结果为空文件")
+
+                        self._finalize_download_file(part_path, save_path)
+
+                        # 下载完成后严格校验图片，避免损坏文件残留
+                        if self.verify_images and not self._is_image_valid(save_path):
+                            try:
+                                os.remove(save_path)
+                            except OSError:
+                                pass
+
+                            if attempt < self.retries - 1:
+                                delay = self._calc_backoff_delay(attempt)
+                                self._emit_progress(
+                                    progress_callback,
+                                    'retry',
+                                    url,
+                                    save_path,
+                                    f'图片校验失败，{delay:.1f}s 后重试 ({attempt + 1}/{self.retries})'
+                                )
+                                time.sleep(delay)
+                                continue
+
+                            self._emit_progress(
+                                progress_callback,
+                                'error',
+                                url,
+                                save_path,
+                                '图片校验失败'
+                            )
+                            return 'error'
+
+                        self._emit_progress(progress_callback, 'success', url, save_path)
+                        return 'success'
+
+                    if status_code == 404:
+                        self._cleanup_partial_file(part_path)
+                        self._emit_progress(
+                            progress_callback,
+                            'not_found',
+                            url,
+                            save_path,
+                            'HTTP 404'
+                        )
+                        return 'failed'
+
+                    if attempt < self.retries - 1:
+                        retry_after = response.headers.get('Retry-After')
+                        delay = self._calc_backoff_delay(
+                            attempt,
+                            status_code=status_code,
+                            retry_after=retry_after
+                        )
+                        self._emit_progress(
+                            progress_callback,
+                            'retry',
+                            url,
+                            save_path,
+                            f'HTTP {status_code}，{delay:.1f}s 后重试 ({attempt + 1}/{self.retries})'
+                        )
+                        time.sleep(delay)
+                        continue
+
+                    self._cleanup_partial_file(part_path)
+                    self._emit_progress(
+                        progress_callback,
+                        'http_error',
+                        url,
+                        save_path,
+                        f'HTTP {status_code}'
+                    )
                     return 'failed'
-                
-            except Exception as e:
+
+            except requests.RequestException as e:
+                self._cleanup_partial_file(part_path)
                 if attempt < self.retries - 1:
-                    # 等待后重试
-                    time.sleep(self.retry_delay * (2 ** attempt))
-                else:
-                    if progress_callback:
-                        progress_callback('error', url, save_path, str(e))
-                    return 'error'
+                    delay = self._calc_backoff_delay(attempt)
+                    self._emit_progress(
+                        progress_callback,
+                        'retry',
+                        url,
+                        save_path,
+                        f'请求异常: {e}，{delay:.1f}s 后重试 ({attempt + 1}/{self.retries})'
+                    )
+                    time.sleep(delay)
+                    continue
+
+                self._emit_progress(progress_callback, 'error', url, save_path, str(e))
+                return 'error'
+            except Exception as e:
+                self._cleanup_partial_file(part_path)
+                if attempt < self.retries - 1:
+                    delay = self._calc_backoff_delay(attempt)
+                    self._emit_progress(
+                        progress_callback,
+                        'retry',
+                        url,
+                        save_path,
+                        f'下载异常: {e}，{delay:.1f}s 后重试 ({attempt + 1}/{self.retries})'
+                    )
+                    time.sleep(delay)
+                    continue
+
+                self._emit_progress(progress_callback, 'error', url, save_path, str(e))
+                return 'error'
         
+        self._cleanup_partial_file(part_path)
         return 'failed'
     
     def download_chapter(self, images: List[str], save_dir: str, 
@@ -127,20 +363,26 @@ class MangaDownloader:
             下载结果统计
         """
         if not images:
-            return {'success': 0, 'failed': 0, 'skipped': 0, 'total': 0}
-        
-        chapter_dir = Path(save_dir) / chapter_name
+            return {'success': 0, 'failed': 0, 'skipped': 0, 'total': 0, 'cancelled': False}
+        safe_chapter_name = sanitize_filename(chapter_name) or "unknown_chapter"
+        chapter_dir = Path(save_dir) / safe_chapter_name
         chapter_dir.mkdir(parents=True, exist_ok=True)
         
         # 章节级别统计（不使用全局self.stats）
-        chapter_stats = {'success': 0, 'failed': 0, 'skipped': 0, 'total': len(images)}
-        
-        # 使用线程池下载
-        with ThreadPoolExecutor(max_workers=self.threads) as executor:
-            futures = {}
-            
+        chapter_stats = {
+            'success': 0,
+            'failed': 0,
+            'skipped': 0,
+            'total': len(images),
+            'cancelled': False
+        }
+        executor = ThreadPoolExecutor(max_workers=self.threads)
+        futures = {}
+
+        try:
             for idx, img_url in enumerate(images, 1):
                 if self.cancelled:
+                    chapter_stats['cancelled'] = True
                     break
                 
                 # 确定文件扩展名
@@ -160,27 +402,43 @@ class MangaDownloader:
                     progress_callback
                 )
                 futures[future] = (idx, img_url)
-            
-            # 收集结果
-            for future in as_completed(futures):
+
+            pending = set(futures.keys())
+            while pending:
                 if self.cancelled:
+                    chapter_stats['cancelled'] = True
                     break
-                
-                idx, img_url = futures[future]
-                try:
-                    status = future.result()
-                    # 根据返回的状态更新统计
+
+                done, pending = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
+                if not done:
+                    continue
+
+                for future in done:
+                    idx, img_url = futures[future]
+                    try:
+                        status = future.result()
+                    except Exception as e:
+                        chapter_stats['failed'] += 1
+                        self._emit_progress(progress_callback, 'error', img_url, '', str(e))
+                        continue
+
                     if status == 'success':
                         chapter_stats['success'] += 1
                     elif status == 'skipped':
                         chapter_stats['skipped'] += 1
-                    else:  # 'failed', 'error'
+                    elif status == 'cancelled':
+                        chapter_stats['cancelled'] = True
+                    else:
                         chapter_stats['failed'] += 1
-                except Exception as e:
-                    chapter_stats['failed'] += 1
-                    if progress_callback:
-                        progress_callback('error', img_url, '', str(e))
-        
+        finally:
+            if self.cancelled:
+                for future in futures:
+                    if not future.done():
+                        future.cancel()
+                executor.shutdown(wait=False, cancel_futures=True)
+            else:
+                executor.shutdown(wait=True, cancel_futures=False)
+
         return chapter_stats
     
     def download_manga(self, manga_info: Dict, chapters_to_download: List[int],
@@ -215,17 +473,20 @@ class MangaDownloader:
                     manga_id = detected_id
                     break
         
-        manga_dir = Path(save_dir) / manga_title
+        manga_dir = Path(save_dir) / (sanitize_filename(manga_title) or "未知漫画")
         manga_dir.mkdir(parents=True, exist_ok=True)
         
         total_stats = {
             'total_chapters': len(chapters_to_download),
+            'processed_chapters': 0,
             'success_chapters': 0,
             'failed_chapters': 0,
             'total_images': 0,
             'success_images': 0,
             'failed_images': 0,
-            'skipped_images': 0
+            'skipped_images': 0,
+            'cancelled': False,
+            'cancelled_chapter': ''
         }
         
         # 重置取消标志和统计
@@ -234,14 +495,17 @@ class MangaDownloader:
         
         for idx, chapter_idx in enumerate(chapters_to_download, 1):
             if self.cancelled:
+                total_stats['cancelled'] = True
                 break
             
             if chapter_idx >= len(manga_info['chapters']):
                 continue
             
             chapter = manga_info['chapters'][chapter_idx]
-            chapter_name = chapter['name']
-            chapter_title = chapter.get('title', chapter_name)
+            chapter_name_raw = chapter.get('name', '')
+            chapter_name_safe = sanitize_filename(chapter_name_raw) or f'chapter_{chapter_idx + 1}'
+            chapter_title = chapter.get('title', chapter_name_raw) or chapter_name_safe
+            total_stats['processed_chapters'] += 1
             
             if chapter_callback:
                 chapter_callback('start', idx, len(chapters_to_download), chapter_title, {})
@@ -254,7 +518,38 @@ class MangaDownloader:
             
             # 如果失败，使用URL探测方法（绕过VIP）
             if not images and manga_id:
-                images = parser.get_chapter_images(manga_id, chapter_name)
+                if chapter_callback:
+                    chapter_callback(
+                        'info',
+                        idx,
+                        len(chapters_to_download),
+                        chapter_title,
+                        {'message': '正在探测VIP图片...'}
+                    )
+                images = parser.get_chapter_images(
+                    manga_id,
+                    chapter_name_raw,
+                    max_pages=500,
+                    is_cancelled=lambda: self.cancelled,
+                    timeout=self.timeout,
+                    log_callback=(
+                        lambda message: chapter_callback(
+                            'info',
+                            idx,
+                            len(chapters_to_download),
+                            chapter_title,
+                            {'message': message}
+                        )
+                        if chapter_callback else None
+                    )
+                )
+
+            if self.cancelled:
+                total_stats['cancelled'] = True
+                total_stats['cancelled_chapter'] = chapter_title
+                if chapter_callback:
+                    chapter_callback('cancelled', idx, len(chapters_to_download), chapter_title, {})
+                break
             
             if not images:
                 total_stats['failed_chapters'] += 1
@@ -267,7 +562,7 @@ class MangaDownloader:
             chapter_stats = self.download_chapter(
                 images, 
                 str(manga_dir), 
-                chapter_name,
+                chapter_name_safe,
                 progress_callback
             )
             
@@ -276,8 +571,15 @@ class MangaDownloader:
             total_stats['success_images'] += chapter_stats['success']
             total_stats['failed_images'] += chapter_stats['failed']
             total_stats['skipped_images'] += chapter_stats['skipped']
+
+            if chapter_stats.get('cancelled'):
+                total_stats['cancelled'] = True
+                total_stats['cancelled_chapter'] = chapter_title
+                if chapter_callback:
+                    chapter_callback('cancelled', idx, len(chapters_to_download), chapter_title, chapter_stats)
+                break
             
-            if chapter_stats['success'] > 0:
+            if chapter_stats['success'] > 0 or chapter_stats['skipped'] > 0:
                 total_stats['success_chapters'] += 1
             else:
                 total_stats['failed_chapters'] += 1

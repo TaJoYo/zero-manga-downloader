@@ -7,7 +7,7 @@
 
 import re
 import requests
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, parse_qs
 
@@ -158,9 +158,80 @@ class MangaParser:
         
         return chapters
     
+    def _probe_image_exists(self, url: str, timeout: int = 10) -> Optional[bool]:
+        """
+        探测图片URL是否存在
+
+        Returns:
+            True: 存在
+            False: 不存在(404)
+            None: 状态不确定(网络错误/限流等)
+        """
+        # 优先HEAD，成本更低
+        try:
+            response = self.session.head(url, timeout=timeout, allow_redirects=True)
+            if response.status_code == 200:
+                return True
+            if response.status_code == 404:
+                return False
+
+            # HEAD受限时降级到 GET + Range
+            if response.status_code in (403, 405):
+                pass
+            else:
+                return None
+        except requests.RequestException:
+            pass
+
+        # 部分CDN/站点会拒绝HEAD，这里降级做轻量GET
+        try:
+            response = self.session.get(
+                url,
+                timeout=timeout,
+                allow_redirects=True,
+                headers={'Range': 'bytes=0-0'},
+                stream=True
+            )
+            if response.status_code in (200, 206):
+                return True
+            if response.status_code == 404:
+                return False
+            return None
+        except requests.RequestException:
+            return None
+
+    def _detect_pattern_for_first_page(
+        self,
+        manga_id: str,
+        chapter_name: str,
+        formats: List[str],
+        timeout: int = 10,
+        is_cancelled: Optional[Callable[[], bool]] = None
+    ) -> Optional[Tuple[int, str, int]]:
+        """探测首个可用规则: (padding_width, ext, first_page)"""
+        page_format_widths = [3, 2, 1]
+
+        # 正常从第1页开始，最多前3页兜底探测，避免某些章节首图偏移
+        for page_num in (1, 2, 3):
+            for ext in formats:
+                for width in page_format_widths:
+                    if is_cancelled and is_cancelled():
+                        return None
+
+                    page_str = str(page_num) if width == 1 else f"{page_num:0{width}d}"
+                    url = f"{self.image_base_url}/{manga_id}/{chapter_name}/{page_str}{ext}"
+                    exists = self._probe_image_exists(url, timeout=timeout)
+                    if exists is True:
+                        return width, ext, page_num
+
+        return None
+
     def get_chapter_images(self, manga_id: str, chapter_name: str, 
                           max_pages: int = 500, formats: List[str] = None,
-                          verbose: bool = False) -> List[str]:
+                          verbose: bool = False,
+                          is_cancelled: Optional[Callable[[], bool]] = None,
+                          timeout: int = 10,
+                          log_callback: Optional[Callable[[str], None]] = None) -> List[str]:
         """
         获取章节的所有图片URL（绕过VIP限制）
         
@@ -170,64 +241,84 @@ class MangaParser:
             max_pages: 最大页数
             formats: 图片格式列表，默认为['.jpg', '.png']
             verbose: 是否输出详细日志
+            is_cancelled: 取消检查回调
+            timeout: 探测超时
+            log_callback: 探测日志回调
         
         Returns:
             图片URL列表
         """
         if formats is None:
             formats = ['.jpg', '.png']
-        
-        if verbose:
-            print(f"  [探测] 章节: {chapter_name}, manga_id: {manga_id}")
-        
+
+        def emit_log(message: str):
+            if verbose:
+                print(message)
+            if log_callback:
+                log_callback(message)
+
+        emit_log(f"  [探测] 章节: {chapter_name}, manga_id: {manga_id}")
+
+        if is_cancelled and is_cancelled():
+            emit_log("  [探测] 用户取消探测")
+            return []
+
+        # 先锁定规则，避免每页进行笛卡尔积尝试
+        pattern = self._detect_pattern_for_first_page(
+            manga_id=manga_id,
+            chapter_name=chapter_name,
+            formats=formats,
+            timeout=timeout,
+            is_cancelled=is_cancelled
+        )
+
+        if not pattern:
+            emit_log("  [探测] 未能锁定可用规则，探测结束")
+            return []
+
+        page_width, ext, first_page = pattern
+        current_ext = ext
+        sample_page = "1" if page_width == 1 else f"{1:0{page_width}d}"
+        emit_log(f"  [探测] 已锁定规则: {sample_page} + {current_ext}")
+
         images = []
-        consecutive_errors = 0
-        max_errors = 5  # 连续5个404就认为章节结束
-        
+        consecutive_failures = 0
+        max_consecutive_failures = 3
+
+        # 从第1页扫描，保证不漏掉前置页
         for page_num in range(1, max_pages + 1):
+            if is_cancelled and is_cancelled():
+                emit_log("  [探测] 用户取消探测")
+                break
+
+            page_str = str(page_num) if page_width == 1 else f"{page_num:0{page_width}d}"
+            # 每页优先当前后缀，失败再尝试其他后缀，避免章节中途后缀切换漏页
+            ext_candidates = [current_ext] + [candidate for candidate in formats if candidate != current_ext]
             found = False
-            
-            # 尝试多种页码格式
-            page_formats = [
-                f"{page_num:03d}",  # 001, 002... (3位数字)
-                f"{page_num:02d}",  # 01, 02... (2位数字)
-                f"{page_num}",      # 1, 2... (无补零)
-            ]
-            
-            # 尝试不同的图片格式
-            for fmt in formats:
-                for page_str in page_formats:
-                    url = f"{self.image_base_url}/{manga_id}/{chapter_name}/{page_str}{fmt}"
-                    
-                    try:
-                        # 使用HEAD请求检查图片是否存在
-                        response = self.session.head(url, timeout=10, allow_redirects=True)
-                        
-                        if response.status_code == 200:
-                            images.append(url)
-                            consecutive_errors = 0
-                            found = True
-                            if verbose and page_num % 20 == 0:
-                                print(f"  [探测] 已找到 {page_num} 页...")
-                            break
-                    
-                    except:
-                        pass
-                
-                # 如果找到，就不用尝试其他格式了
-                if found:
+
+            for candidate_ext in ext_candidates:
+                url = f"{self.image_base_url}/{manga_id}/{chapter_name}/{page_str}{candidate_ext}"
+                exists = self._probe_image_exists(url, timeout=timeout)
+                if exists is True:
+                    images.append(url)
+                    if candidate_ext != current_ext:
+                        emit_log(f"  [探测] 第{page_num}页后缀切换: {current_ext} -> {candidate_ext}")
+                        current_ext = candidate_ext
+                    consecutive_failures = 0
+                    found = True
                     break
-            
-            if not found:
-                consecutive_errors += 1
-                if consecutive_errors >= max_errors:
-                    if verbose:
-                        print(f"  [探测] 连续{max_errors}个404，探测结束")
-                    break
-        
-        if verbose:
-            print(f"  [探测] 完成，共找到 {len(images)} 张图片")
-        
+
+            if found:
+                if page_num % 20 == 0:
+                    emit_log(f"  [探测] 已找到 {len(images)} 张图片...")
+                continue
+
+            consecutive_failures += 1
+            if consecutive_failures >= max_consecutive_failures and page_num >= first_page:
+                emit_log(f"  [探测] 连续{max_consecutive_failures}次失败，探测结束")
+                break
+
+        emit_log(f"  [探测] 完成，共找到 {len(images)} 张图片")
         return images
     
     def get_chapter_images_from_page(self, chapter_url: str) -> List[str]:

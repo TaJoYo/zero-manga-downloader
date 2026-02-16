@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from PyQt5.QtWidgets import (
     QApplication, QFileDialog, QMessageBox, QSpinBox, QSlider, QListWidget, 
-    QListWidgetItem, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QDialog
+    QListWidgetItem, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QDialog, QCheckBox
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont
@@ -531,6 +531,13 @@ class MangaDownloaderWindow(FluentWindow):
         browse_btn.clicked.connect(self.select_download_dir)
         dir_row.addWidget(browse_btn, 0)
         dl_layout.addLayout(dir_row)
+
+        # 图片完整性校验
+        verify_row = self._create_setting_row('图片校验:', 120)
+        self.verify_images_checkbox = QCheckBox('严格校验已存在图片（损坏自动重下）')
+        verify_row.addWidget(self.verify_images_checkbox, 1)
+        verify_row.addStretch()
+        dl_layout.addLayout(verify_row)
         
         scroll_layout.addWidget(download_card)
         
@@ -719,7 +726,8 @@ class MangaDownloaderWindow(FluentWindow):
         self.downloader = MangaDownloader(
             threads=self.config.get_download_threads(),
             retries=self.config.get_retries(),
-            retry_delay=self.config.get_retry_delay()
+            retry_delay=self.config.get_retry_delay(),
+            verify_images=self.config.get_verify_images()
         )
         
         self.download_thread = DownloadThread(
@@ -749,7 +757,17 @@ class MangaDownloaderWindow(FluentWindow):
     
     def on_download_progress(self, status: str, url: str, detail: str):
         """下载进度更新"""
-        pass
+        file_hint = Path(url).name if url else ''
+        if status == 'retry':
+            self.log(f'↻ 重试: {file_hint} - {detail}')
+        elif status == 'http_error':
+            self.log(f'✗ HTTP错误: {file_hint} - {detail}')
+        elif status == 'error':
+            self.log(f'✗ 下载异常: {file_hint} - {detail}')
+        elif status == 'not_found':
+            self.log(f'✗ 图片不存在: {file_hint}')
+        elif status == 'cancelled':
+            self.log('⏹ 当前图片下载已取消')
     
     def on_chapter_progress(self, status: str, current: int, total: int,
                            name: str, stats: dict):
@@ -771,25 +789,56 @@ class MangaDownloaderWindow(FluentWindow):
         elif status == 'failed':
             error_msg = stats.get('error', '未知错误')
             self.log(f'[{current}/{total}] ✗ {name} - {error_msg}')
+
+        elif status == 'info':
+            message = stats.get('message', '')
+            if message:
+                self.log(f'[{current}/{total}] · {message}')
+
+        elif status == 'cancelled':
+            self.status_label.setText(f'已取消: {name} ({current}/{total})')
+            self.log(f'[{current}/{total}] ⏹ 已取消 {name}')
     
     def on_download_finished(self, stats: dict):
         """下载完成"""
         self.download_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
         self.parse_btn.setEnabled(True)
-        self.progress_bar.setValue(100)
         
         success_chapters = stats.get('success_chapters', 0)
         total_chapters = stats.get('total_chapters', 0)
         success_images = stats.get('success_images', 0)
         failed_images = stats.get('failed_images', 0)
-        
+
+        if stats.get('cancelled'):
+            cancelled_chapter = stats.get('cancelled_chapter') or '未知章节'
+            self.log('\n⏹ 下载已取消')
+            self.log(f'  取消位置: {cancelled_chapter}')
+            self.log(f'  章节: {success_chapters}/{total_chapters}')
+            self.log(f'  图片: {success_images}成/{failed_images}失')
+            self.status_label.setText('⏹ 已取消')
+
+            if self.config.is_history_enabled() and self.current_manga:
+                self.history.add_record(
+                    self.current_manga['url'],
+                    self.current_manga['title'],
+                    total_chapters,
+                    'cancelled'
+                )
+
+            self.show_info_bar(
+                f'已取消于: {cancelled_chapter}  |  图片: {success_images}成/{failed_images}失',
+                '已取消',
+                InfoBarPosition.TOP
+            )
+            return
+
+        self.progress_bar.setValue(100)
         self.log(f'\n✓✓✓ 下载完成！')
         self.log(f'  章节: {success_chapters}/{total_chapters}')
         self.log(f'  图片: {success_images}成/{failed_images}失')
-        
         self.status_label.setText('✓ 下载完成')
-        
+
         if self.config.is_history_enabled() and self.current_manga:
             status = 'completed' if success_chapters == total_chapters else 'partial'
             self.history.add_record(
@@ -798,7 +847,7 @@ class MangaDownloaderWindow(FluentWindow):
                 total_chapters,
                 status
             )
-        
+
         self.show_info_bar(
             f'成功: {success_chapters}/{total_chapters}  |  '
             f'图片: {success_images}成/{failed_images}失',
@@ -859,6 +908,7 @@ class MangaDownloaderWindow(FluentWindow):
         self.config.set_retries(self.retry_spin.value())
         self.config.set_retry_delay(self.delay_spin.value())
         self.config.set_download_dir(self.download_dir_input.text())
+        self.config.set_verify_images(self.verify_images_checkbox.isChecked())
         
         # 字体大小已在滑块变化时实时保存
         self.show_info_bar('设置已保存', '成功', InfoBarPosition.TOP)
@@ -871,6 +921,7 @@ class MangaDownloaderWindow(FluentWindow):
         self.retry_spin.setValue(self.config.get_retries())
         self.delay_spin.setValue(self.config.get_retry_delay())
         self.download_dir_input.setText(self.config.get_download_dir())
+        self.verify_images_checkbox.setChecked(self.config.get_verify_images())
         
         self.font_slider.setValue(self.config.get_font_size())
     

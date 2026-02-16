@@ -28,6 +28,7 @@ class ConfigManager:
             'retry_delay': 2,  # 重试延迟(秒)
             'download_dir': str(Path.home() / 'Downloads'),  # 下载目录
             'timeout': 15,  # 请求超时(秒)
+            'verify_images': True,  # 严格校验图片完整性
         },
         
         # 界面设置
@@ -179,6 +180,14 @@ class ConfigManager:
         """设置重试延迟"""
         delay = max(0, min(60, delay))
         return self.set('download.retry_delay', delay)
+
+    def get_verify_images(self) -> bool:
+        """是否严格校验图片完整性"""
+        return bool(self.get('download.verify_images', True))
+
+    def set_verify_images(self, enabled: bool) -> bool:
+        """设置图片严格校验开关"""
+        return self.set('download.verify_images', bool(enabled))
     
     def get_username(self) -> str:
         """获取用户名"""
