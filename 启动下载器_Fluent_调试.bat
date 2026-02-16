@@ -1,10 +1,19 @@
 @echo off
-chcp 65001 >nul
 setlocal
 cd /d "%~dp0"
 
-echo 启动零漫画下载器（调试模式）...
-python gui_downloader_fluent.py
+echo Starting Zero Manga Downloader (Debug mode)...
+where python >nul 2>nul
+if %errorlevel% neq 0 (
+    echo Python was not found in PATH.
+    echo Please install Python and run install_requirements.bat first.
+    pause
+    exit /b 1
+)
+
+python "%~dp0gui_downloader_fluent.py"
+
 echo.
-echo 程序已退出，按任意键关闭窗口。
+echo Program exited with code %errorlevel%.
+echo Press any key to close this window.
 pause >nul
