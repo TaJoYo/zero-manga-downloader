@@ -9,11 +9,13 @@ import random
 import re
 import shutil
 import time
+import zipfile
 import requests
+from requests.adapters import HTTPAdapter
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import List, Dict, Callable, Optional
+from typing import List, Dict, Callable, Optional, Tuple
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from PIL import Image
 
@@ -34,7 +36,8 @@ class MangaDownloader:
     
     def __init__(self, threads: int = 15, retries: int = 3, 
                  retry_delay: int = 2, timeout: int = 15,
-                 verify_images: bool = True):
+                 verify_images: bool = True,
+                 output_format: str = 'folder'):
         """
         初始化下载器
         
@@ -44,12 +47,15 @@ class MangaDownloader:
             retry_delay: 重试延迟(秒)
             timeout: 请求超时(秒)
             verify_images: 是否严格校验已存在/已下载图片
+            output_format: 输出格式（folder/zip/cbz）
         """
         self.threads = threads
         self.retries = retries
         self.retry_delay = retry_delay
-        self.timeout = timeout
+        self.timeout_pair = self._normalize_timeout(timeout)
+        self.timeout = self.timeout_pair[1]
         self.verify_images = verify_images
+        self.output_format = self._normalize_output_format(output_format)
         
         self.session = requests.Session()
         self.session.headers.update({
@@ -57,6 +63,7 @@ class MangaDownloader:
             'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
             'Referer': 'https://www.zerobywai.com/'
         })
+        self._configure_session_pool()
         
         # 下载统计
         self.stats = {
@@ -68,6 +75,73 @@ class MangaDownloader:
         
         # 是否取消下载
         self.cancelled = False
+
+    def _normalize_timeout(self, timeout: int) -> Tuple[float, float]:
+        """统一转为 (connect, read) 超时配置"""
+        if isinstance(timeout, (tuple, list)) and len(timeout) == 2:
+            try:
+                connect = max(1.0, float(timeout[0]))
+                read = max(1.0, float(timeout[1]))
+            except (TypeError, ValueError):
+                connect, read = 5.0, 15.0
+            return connect, read
+
+        try:
+            timeout_value = max(1.0, float(timeout))
+        except (TypeError, ValueError):
+            timeout_value = 15.0
+        connect_timeout = min(10.0, timeout_value)
+        return connect_timeout, timeout_value
+
+    def _configure_session_pool(self):
+        """为 requests.Session 配置连接池"""
+        pool_size = max(10, int(self.threads))
+        adapter = HTTPAdapter(
+            pool_connections=pool_size,
+            pool_maxsize=pool_size,
+            max_retries=0,
+            pool_block=True
+        )
+        self.session.mount('http://', adapter)
+        self.session.mount('https://', adapter)
+
+    def _normalize_output_format(self, output_format: str) -> str:
+        """规范输出格式值"""
+        normalized = str(output_format).strip().lower()
+        if normalized not in {'folder', 'zip', 'cbz'}:
+            return 'folder'
+        return normalized
+
+    def _is_existing_archive_usable(self, archive_path: Path) -> bool:
+        """检查已存在压缩包是否可复用"""
+        try:
+            return archive_path.exists() and archive_path.is_file() and archive_path.stat().st_size > 0
+        except OSError:
+            return False
+
+    def _package_chapter_as_archive(self, chapter_dir: Path, archive_path: Path) -> bool:
+        """将章节目录打包为 zip/cbz 并删除章节目录"""
+        try:
+            image_files = sorted([p for p in chapter_dir.iterdir() if p.is_file()])
+        except OSError:
+            image_files = []
+
+        if not image_files:
+            return False
+
+        archive_tmp_path = archive_path.with_name(archive_path.name + '.part')
+        self._cleanup_partial_file(str(archive_tmp_path))
+        try:
+            archive_path.parent.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(archive_tmp_path, mode='w', compression=zipfile.ZIP_DEFLATED) as zip_file:
+                for image_path in image_files:
+                    zip_file.write(image_path, arcname=image_path.name)
+            os.replace(str(archive_tmp_path), str(archive_path))
+            shutil.rmtree(chapter_dir, ignore_errors=True)
+            return True
+        except Exception:
+            self._cleanup_partial_file(str(archive_tmp_path))
+            return False
 
     def _emit_progress(self, progress_callback: Callable, status: str,
                       url: str, save_path: str = '', detail: str = ''):
@@ -217,7 +291,7 @@ class MangaDownloader:
                 return 'cancelled'
             
             try:
-                with self.session.get(url, timeout=self.timeout, stream=True) as response:
+                with self.session.get(url, timeout=self.timeout_pair, stream=True) as response:
                     status_code = response.status_code
 
                     if status_code == 200:
@@ -481,6 +555,7 @@ class MangaDownloader:
             'processed_chapters': 0,
             'success_chapters': 0,
             'failed_chapters': 0,
+            'planned_images': 0,
             'total_images': 0,
             'success_images': 0,
             'failed_images': 0,
@@ -505,10 +580,39 @@ class MangaDownloader:
             chapter_name_raw = chapter.get('name', '')
             chapter_name_safe = sanitize_filename(chapter_name_raw) or f'chapter_{chapter_idx + 1}'
             chapter_title = chapter.get('title', chapter_name_raw) or chapter_name_safe
+            chapter_archive_path = None
+            if self.output_format in {'zip', 'cbz'}:
+                chapter_archive_path = manga_dir / f'{chapter_name_safe}.{self.output_format}'
             total_stats['processed_chapters'] += 1
             
             if chapter_callback:
                 chapter_callback('start', idx, len(chapters_to_download), chapter_title, {})
+
+            if chapter_archive_path and self._is_existing_archive_usable(chapter_archive_path):
+                if chapter_callback:
+                    chapter_callback(
+                        'info',
+                        idx,
+                        len(chapters_to_download),
+                        chapter_title,
+                        {'message': f'已存在章节压缩包，跳过: {chapter_archive_path.name}'}
+                    )
+                    chapter_callback(
+                        'complete',
+                        idx,
+                        len(chapters_to_download),
+                        chapter_title,
+                        {
+                            'success': 0,
+                            'failed': 0,
+                            'skipped': 1,
+                            'total': 1,
+                            'cancelled': False,
+                            'archive_path': str(chapter_archive_path)
+                        }
+                    )
+                total_stats['success_chapters'] += 1
+                continue
             
             # 获取章节图片
             images = []
@@ -531,7 +635,7 @@ class MangaDownloader:
                     chapter_name_raw,
                     max_pages=500,
                     is_cancelled=lambda: self.cancelled,
-                    timeout=self.timeout,
+                    timeout=self.timeout_pair[1],
                     log_callback=(
                         lambda message: chapter_callback(
                             'info',
@@ -557,6 +661,19 @@ class MangaDownloader:
                     chapter_callback('failed', idx, len(chapters_to_download), 
                                    chapter_title, {'error': '无法获取图片'})
                 continue
+
+            total_stats['planned_images'] += len(images)
+            if chapter_callback:
+                chapter_callback(
+                    'images_total',
+                    idx,
+                    len(chapters_to_download),
+                    chapter_title,
+                    {
+                        'chapter_images': len(images),
+                        'planned_images': total_stats['planned_images']
+                    }
+                )
             
             # 下载章节
             chapter_stats = self.download_chapter(
@@ -565,6 +682,27 @@ class MangaDownloader:
                 chapter_name_safe,
                 progress_callback
             )
+
+            if self.output_format in {'zip', 'cbz'} and not chapter_stats.get('cancelled'):
+                chapter_dir_path = manga_dir / chapter_name_safe
+                chapter_archive_path = manga_dir / f'{chapter_name_safe}.{self.output_format}'
+                packaged = self._package_chapter_as_archive(
+                    chapter_dir_path,
+                    chapter_archive_path
+                )
+                if packaged:
+                    chapter_stats['archive_path'] = str(chapter_archive_path)
+                    if chapter_callback:
+                        chapter_callback(
+                            'info',
+                            idx,
+                            len(chapters_to_download),
+                            chapter_title,
+                            {'message': f'章节已打包: {chapter_archive_path.name}'}
+                        )
+                else:
+                    chapter_stats['package_failed'] = True
+                    chapter_stats['error'] = f'章节打包失败: {chapter_archive_path.name}'
             
             # 更新统计
             total_stats['total_images'] += chapter_stats['total']
@@ -578,6 +716,18 @@ class MangaDownloader:
                 if chapter_callback:
                     chapter_callback('cancelled', idx, len(chapters_to_download), chapter_title, chapter_stats)
                 break
+
+            if chapter_stats.get('package_failed'):
+                total_stats['failed_chapters'] += 1
+                if chapter_callback:
+                    chapter_callback(
+                        'failed',
+                        idx,
+                        len(chapters_to_download),
+                        chapter_title,
+                        {'error': chapter_stats.get('error', '章节打包失败')}
+                    )
+                continue
             
             if chapter_stats['success'] > 0 or chapter_stats['skipped'] > 0:
                 total_stats['success_chapters'] += 1

@@ -5,9 +5,11 @@
 通过直接访问图片URL绕过VIP限制
 """
 
+import json
 import re
 import requests
-from typing import Callable, Dict, List, Optional, Tuple
+from requests.adapters import HTTPAdapter
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, parse_qs
 
@@ -16,6 +18,7 @@ class MangaParser:
     """零漫画解析器"""
     
     def __init__(self, session: requests.Session = None):
+        self._external_session = session is not None
         self.session = session or requests.Session()
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -23,8 +26,40 @@ class MangaParser:
             'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
             'Referer': 'https://www.zerobywai.com/'
         })
+        if not self._external_session:
+            self._configure_session_pool()
         self.base_url = 'https://www.zerobywai.com'
         self.image_base_url = 'https://tupa.zerobywai.com/manhua'
+        self.default_timeout = self._normalize_timeout(15)
+        self.last_chapter_parse_error = ''
+
+    def _normalize_timeout(self, timeout: int) -> Tuple[float, float]:
+        """统一转为 (connect, read) 超时配置"""
+        if isinstance(timeout, (tuple, list)) and len(timeout) == 2:
+            try:
+                connect = max(1.0, float(timeout[0]))
+                read = max(1.0, float(timeout[1]))
+            except (TypeError, ValueError):
+                connect, read = 5.0, 15.0
+            return connect, read
+
+        try:
+            timeout_value = max(1.0, float(timeout))
+        except (TypeError, ValueError):
+            timeout_value = 15.0
+        connect_timeout = min(10.0, timeout_value)
+        return connect_timeout, timeout_value
+
+    def _configure_session_pool(self):
+        """配置连接池，避免高并发时连接资源争用"""
+        adapter = HTTPAdapter(
+            pool_connections=10,
+            pool_maxsize=20,
+            max_retries=0,
+            pool_block=True
+        )
+        self.session.mount('http://', adapter)
+        self.session.mount('https://', adapter)
     
     def parse_manga_url(self, url: str) -> Optional[Dict]:
         """
@@ -46,11 +81,11 @@ class MangaParser:
                 raise ValueError("无法从URL中提取kuid参数")
             
             # 请求页面
-            response = self.session.get(url, timeout=15)
+            response = self.session.get(url, timeout=self.default_timeout)
             response.encoding = 'utf-8'
             
             if response.status_code != 200:
-                raise ValueError(f"请求失败，状态码: {response.status_code}")
+                raise ValueError(f"网络请求失败，状态码: {response.status_code}")
             
             html = response.text
             soup = BeautifulSoup(html, 'html.parser')
@@ -62,7 +97,11 @@ class MangaParser:
             chapters = self._extract_chapters(html)
             
             if not chapters:
-                raise ValueError("未找到章节信息")
+                if self.last_chapter_parse_error:
+                    raise ValueError(
+                        f"章节解析失败：{self.last_chapter_parse_error}（可能是站点结构变化）"
+                    )
+                raise ValueError("未找到章节信息，可能是网络异常或页面结构变化")
             
             # 提取漫画ID（用于图片URL）
             manga_id = self._extract_manga_id(html)
@@ -75,11 +114,6 @@ class MangaParser:
                     if detected_id:
                         manga_id = detected_id
                         break
-            
-            # [调试] 输出manga_id
-            
-            if not chapters:
-                raise ValueError("未找到章节信息")
             
             return {
                 'title': title,
@@ -133,30 +167,90 @@ class MangaParser:
         return None
     
     def _extract_chapters(self, html: str) -> List[Dict]:
-        """提取章节列表"""
-        chapters = []
-        
-        # 从JavaScript变量中提取章节数据
-        pattern = r'const\s+chapters\s*=\s*(\[.*?\]);'
-        match = re.search(pattern, html, re.DOTALL)
-        
-        if match:
-            chapters_json = match.group(1)
-            # 提取zjid和zjname
-            chapter_pattern =r'{\s*"zjid"\s*:\s*"(\d+)"\s*,\s*"zjname"\s*:\s*"([^"]+)"\s*}'
-            
-            for match in re.finditer(chapter_pattern, chapters_json):
-                zjid = match.group(1)
-                zjname = match.group(2)
-                
-                chapters.append({
-                    'zjid': zjid,
-                    'name': zjname,
-                    'title': f"第{zjname}话" if zjname.isdigit() else zjname,
-                    'url': f'{self.base_url}/pc/manga_read_pc.php?zjid={zjid}'
-                })
-        
+        """提取章节列表（优先 JSON 解析，正则兜底）"""
+        self.last_chapter_parse_error = ''
+        chapters_payload = self._find_chapters_payload(html)
+        if not chapters_payload:
+            self.last_chapter_parse_error = '页面脚本中未找到 chapters 数据'
+            return []
+
+        chapters = self._parse_chapters_by_json(chapters_payload)
+        if chapters:
+            return chapters
+
+        chapters = self._parse_chapters_by_regex(chapters_payload)
+        if chapters:
+            return chapters
+
+        self.last_chapter_parse_error = 'chapters 数据存在但 JSON/正则解析均失败'
+        return []
+
+    def _find_chapters_payload(self, html: str) -> Optional[str]:
+        """从页面脚本中提取 chapters 数组文本"""
+        patterns = [
+            r'(?:const|let|var)\s+chapters\s*=\s*(\[[\s\S]*?\])\s*;',
+            r'chapters\s*:\s*(\[[\s\S]*?\])\s*[,\n}]'
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, html, re.DOTALL)
+            if match:
+                return match.group(1).strip()
+        return None
+
+    def _parse_chapters_by_json(self, chapters_payload: str) -> List[Dict]:
+        """将 chapters 数组作为 JSON 解析"""
+        candidates = [chapters_payload, re.sub(r',\s*([}\]])', r'\1', chapters_payload)]
+        for candidate in candidates:
+            try:
+                data = json.loads(candidate)
+                return self._convert_chapters_data(data)
+            except (json.JSONDecodeError, TypeError):
+                continue
+        return []
+
+    def _parse_chapters_by_regex(self, chapters_payload: str) -> List[Dict]:
+        """JSON 失败时按对象块正则兜底解析"""
+        chapters: List[Dict] = []
+        for obj_match in re.finditer(r'\{[^{}]*\}', chapters_payload, re.DOTALL):
+            obj_text = obj_match.group(0)
+            zjid_match = re.search(r'"zjid"\s*:\s*"([^"]+)"', obj_text)
+            zjname_match = re.search(r'"zjname"\s*:\s*"([^"]+)"', obj_text)
+            if not zjid_match or not zjname_match:
+                continue
+
+            chapter = self._build_chapter_entry(zjid_match.group(1), zjname_match.group(1))
+            if chapter:
+                chapters.append(chapter)
         return chapters
+
+    def _convert_chapters_data(self, data: Any) -> List[Dict]:
+        """将 JSON 数据标准化为章节列表"""
+        if not isinstance(data, list):
+            return []
+
+        chapters: List[Dict] = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+
+            zjid = str(item.get('zjid', '')).strip()
+            zjname = str(item.get('zjname', '')).strip()
+            chapter = self._build_chapter_entry(zjid, zjname)
+            if chapter:
+                chapters.append(chapter)
+        return chapters
+
+    def _build_chapter_entry(self, zjid: str, zjname: str) -> Optional[Dict]:
+        """构建统一章节结构"""
+        if not zjid or not zjname:
+            return None
+
+        return {
+            'zjid': zjid,
+            'name': zjname,
+            'title': f"第{zjname}话" if zjname.isdigit() else zjname,
+            'url': f'{self.base_url}/pc/manga_read_pc.php?zjid={zjid}'
+        }
     
     def _probe_image_exists(self, url: str, timeout: int = 10) -> Optional[bool]:
         """
@@ -167,9 +261,11 @@ class MangaParser:
             False: 不存在(404)
             None: 状态不确定(网络错误/限流等)
         """
+        request_timeout = self._normalize_timeout(timeout)
+
         # 优先HEAD，成本更低
         try:
-            response = self.session.head(url, timeout=timeout, allow_redirects=True)
+            response = self.session.head(url, timeout=request_timeout, allow_redirects=True)
             if response.status_code == 200:
                 return True
             if response.status_code == 404:
@@ -187,7 +283,7 @@ class MangaParser:
         try:
             response = self.session.get(
                 url,
-                timeout=timeout,
+                timeout=request_timeout,
                 allow_redirects=True,
                 headers={'Range': 'bytes=0-0'},
                 stream=True
@@ -332,7 +428,7 @@ class MangaParser:
             图片URL列表
         """
         try:
-            response = self.session.get(chapter_url, timeout=15)
+            response = self.session.get(chapter_url, timeout=self.default_timeout)
             response.encoding = 'utf-8'
             
             if response.status_code != 200:
@@ -398,7 +494,7 @@ class MangaParser:
             漫画ID
         """
         try:
-            response = self.session.get(chapter_url, timeout=15)
+            response = self.session.get(chapter_url, timeout=self.default_timeout)
             response.encoding = 'utf-8'
             
             # 从图片URL中提取manga_id
@@ -410,5 +506,5 @@ class MangaParser:
             
             return None
             
-        except:
+        except Exception:
             return None

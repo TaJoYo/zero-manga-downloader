@@ -77,6 +77,8 @@ python gui_downloader_fluent.py
    - 下载线程数（1-50）
    - 重试次数（1-10）
    - 重试延迟（0-60秒）
+   - 请求超时（3-120秒）
+   - 输出格式（章节文件夹 / ZIP / CBZ）
    - 严格校验已存在图片（损坏自动重下）
    - 下载目录
    - 历史记录管理
@@ -107,24 +109,40 @@ zero-manga-downloader/
 
 ```json
 {
-  "account": {
-    "username": "",
-    "password": "",
-    "cookies": {}
-  },
   "download": {
     "threads": 15,
     "retries": 3,
     "retry_delay": 2,
     "download_dir": "~/Downloads",
     "timeout": 15,
-    "verify_images": true
+    "verify_images": true,
+    "output_format": "folder"
+  },
+  "ui": {
+    "language": "zh-CN",
+    "window_size": [900, 700],
+    "window_position": null,
+    "font_size": 10
   },
   "history": {
     "enabled": true,
     "max_records": 100
   }
 }
+```
+
+`output_format` 说明：
+- `folder`：每章为一个文件夹（当前默认行为）
+- `zip`：每章输出为 `.zip` 压缩包
+- `cbz`：每章输出为 `.cbz`（与 zip 内容相同，仅后缀不同）
+
+当使用 `zip/cbz` 时，目录结构为：
+```text
+下载目录/
+└── 漫画名称/
+    ├── 第1话.zip/.cbz
+    ├── 第2话.zip/.cbz
+    └── ...
 ```
 
 ## 📝 历史记录

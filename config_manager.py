@@ -14,13 +14,6 @@ class ConfigManager:
     """配置管理器"""
     
     DEFAULT_CONFIG = {
-        # 账户设置
-        'account': {
-            'username': '',
-            'password': '',
-            'cookies': {}
-        },
-        
         # 下载设置
         'download': {
             'threads': 15,  # 下载线程数
@@ -29,11 +22,11 @@ class ConfigManager:
             'download_dir': str(Path.home() / 'Downloads'),  # 下载目录
             'timeout': 15,  # 请求超时(秒)
             'verify_images': True,  # 严格校验图片完整性
+            'output_format': 'folder',  # 输出格式: folder/zip/cbz
         },
         
         # 界面设置
         'ui': {
-            'theme': 'light',  # light, dark, auto
             'language': 'zh-CN',
             'window_size': [900, 700],
             'window_position': None,
@@ -73,8 +66,14 @@ class ConfigManager:
                 return self.DEFAULT_CONFIG.copy()
         else:
             # 创建默认配置文件
-            self.save_config()
-            return self.DEFAULT_CONFIG.copy()
+            default_config = self.DEFAULT_CONFIG.copy()
+            try:
+                self.config_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(self.config_file, 'w', encoding='utf-8') as f:
+                    json.dump(default_config, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                print(f"创建默认配置文件失败: {e}")
+            return default_config
     
     def _merge_config(self, default: Dict, loaded: Dict) -> Dict:
         """递归合并配置，保留默认配置中的所有键"""
@@ -181,6 +180,32 @@ class ConfigManager:
         delay = max(0, min(60, delay))
         return self.set('download.retry_delay', delay)
 
+    def get_timeout(self) -> int:
+        """获取请求超时"""
+        try:
+            return int(self.get('download.timeout', 15))
+        except (TypeError, ValueError):
+            return 15
+
+    def set_timeout(self, timeout_seconds: int) -> bool:
+        """设置请求超时"""
+        timeout_seconds = max(3, min(120, int(timeout_seconds)))
+        return self.set('download.timeout', timeout_seconds)
+
+    def get_output_format(self) -> str:
+        """获取输出格式"""
+        output_format = str(self.get('download.output_format', 'folder')).strip().lower()
+        if output_format not in {'folder', 'zip', 'cbz'}:
+            return 'folder'
+        return output_format
+
+    def set_output_format(self, output_format: str) -> bool:
+        """设置输出格式"""
+        normalized = str(output_format).strip().lower()
+        if normalized not in {'folder', 'zip', 'cbz'}:
+            normalized = 'folder'
+        return self.set('download.output_format', normalized)
+
     def get_verify_images(self) -> bool:
         """是否严格校验图片完整性"""
         return bool(self.get('download.verify_images', True))
@@ -189,30 +214,6 @@ class ConfigManager:
         """设置图片严格校验开关"""
         return self.set('download.verify_images', bool(enabled))
     
-    def get_username(self) -> str:
-        """获取用户名"""
-        return self.get('account.username', '')
-    
-    def set_username(self, username: str) -> bool:
-        """设置用户名"""
-        return self.set('account.username', username)
-    
-    def get_password(self) -> str:
-        """获取密码"""
-        return self.get('account.password', '')
-    
-    def set_password(self, password: str) -> bool:
-        """设置密码"""
-        return self.set('account.password', password)
-    
-    def get_cookies(self) -> Dict[str, str]:
-        """获取Cookie"""
-        return self.get('account.cookies', {})
-    
-    def set_cookies(self, cookies: Dict[str, str]) -> bool:
-        """设置Cookie"""
-        return self.set('account.cookies', cookies)
-    
     def is_history_enabled(self) -> bool:
         """检查历史记录是否启用"""
         return self.get('history.enabled', True)
@@ -220,16 +221,6 @@ class ConfigManager:
     def get_max_history_records(self) -> int:
         """获取最大历史记录数"""
         return self.get('history.max_records', 100)
-    
-    def get_theme(self) -> str:
-        """获取主题设置"""
-        return self.get('ui.theme', 'light')
-    
-    def set_theme(self, theme: str) -> bool:
-        """设置主题"""
-        if theme in ['light', 'dark', 'auto']:
-            return self.set('ui.theme', theme)
-        return False
     
     def get_font_size(self) -> int:
         """获取字体大小"""

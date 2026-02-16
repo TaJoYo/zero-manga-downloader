@@ -7,7 +7,7 @@
 import sys
 from pathlib import Path
 from PyQt5.QtWidgets import (
-    QApplication, QFileDialog, QMessageBox, QSpinBox, QSlider, QListWidget, 
+    QApplication, QFileDialog, QMessageBox, QSpinBox, QSlider, QComboBox, QListWidget, 
     QListWidgetItem, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QDialog, QCheckBox
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
@@ -75,6 +75,7 @@ class MangaDownloaderWindow(FluentWindow):
         
         # 当前漫画信息
         self.current_manga = None
+        self._reset_image_progress_counters()
         
         # 应用主题
         self.apply_theme()
@@ -120,20 +121,8 @@ class MangaDownloaderWindow(FluentWindow):
         input_height = max(36, font_size + 16)        # 输入框高度 - 与按钮对齐
         large_btn_width = max(100, font_size * 10)
         
-        # 根据主题选择颜色（暗黑模式 vs 明亮模式）
-        theme_setting = self.config.get_theme()
-        is_dark = True if theme_setting == 'dark' else False
-        
-        if is_dark:
-            # 深色模式颜色
-            border_color = "#3C3C3C"
-            slider_handle = "#2196F3"
-            slider_handle_hover = "#42A5F5"
-        else:
-            # 明亮模式颜色
-            border_color = "#E0E0E0"
-            slider_handle = "#2196F3"
-            slider_handle_hover = "#1976D2"
+        slider_handle = "#2196F3"
+        slider_handle_hover = "#1976D2"
         
         # 全局样式表 - 仅设置尺寸，让 Fluent 控制所有颜色/背景/字体颜色
         title_size = max(13, font_size + 3)
@@ -145,7 +134,7 @@ class MangaDownloaderWindow(FluentWindow):
             QPushButton {{ padding: 6px 12px; min-height: {btn_height}px; }}
             
             /* 标题样式 */
-            #dl_title, #ui_title, #acc_title, #hist_title {{ 
+            #dl_title, #ui_title, #hist_title {{ 
                 font-weight: bold;
                 font-size: {title_size}pt;
             }}
@@ -178,8 +167,8 @@ class MangaDownloaderWindow(FluentWindow):
         
         QApplication.instance().setStyleSheet(stylesheet)
         
-        # 动态更新控件颜色 - 根据当前主题
-        self._update_dynamic_colors(is_dark)
+        # 动态更新控件颜色
+        self._update_dynamic_colors()
         
         # 直接更新所有控件的尺寸（确保覆盖样式表）
         # 首页按钮
@@ -202,20 +191,18 @@ class MangaDownloaderWindow(FluentWindow):
         # 设置页按钮和控件
         if hasattr(self, 'threads_slider'):
             self.threads_slider.setMinimumHeight(32)
+        if hasattr(self, 'output_format_combo'):
+            self.output_format_combo.setMinimumHeight(32)
+        if hasattr(self, 'timeout_spin'):
+            self.timeout_spin.setMinimumHeight(32)
         if hasattr(self, 'font_slider'):
             self.font_slider.setMinimumHeight(32)
     
-    def _update_dynamic_colors(self, is_dark: bool):
-        """根据主题动态更新硬编码颜色的控件"""
-        # 选择颜色方案
-        if is_dark:
-            hint_color = "#AAAAAA"      # 深色模式：浅灰色提示
-            label_color = "#CCCCCC"     # 深色模式：更浅的标签色
-            warning_color = "#FFB74D"   # 深色模式：更亮的橙色
-        else:
-            hint_color = "#999"         # 明亮模式：深灰色提示
-            label_color = "#666"        # 明亮模式：深灰色标签
-            warning_color = "#FF9800"   # 明亮模式：橙色
+    def _update_dynamic_colors(self):
+        """更新硬编码颜色的控件"""
+        hint_color = "#999"
+        label_color = "#666"
+        warning_color = "#FF9800"
         
         # 更新示例文本颜色
         if hasattr(self, 'example'):
@@ -228,6 +215,30 @@ class MangaDownloaderWindow(FluentWindow):
         # 更新提示按钮颜色
         if hasattr(self, 'note'):
             self.note.setStyleSheet(f'color: {warning_color}; font-size: 12px; margin-left: 130px;')
+
+    def _reset_image_progress_counters(self):
+        """重置图片级进度统计"""
+        self.planned_images = 0
+        self.processed_images = 0
+        self.success_image_count = 0
+        self.failed_image_count = 0
+        self.skipped_image_count = 0
+
+    def _update_image_progress_bar(self):
+        """根据图片级统计更新进度条"""
+        if self.planned_images <= 0:
+            self.progress_bar.setValue(0)
+            return
+
+        progress = int((self.processed_images / self.planned_images) * 100)
+        progress = max(0, min(progress, 100))
+        self.progress_bar.setValue(progress)
+
+        if not self.download_btn.isEnabled():
+            self.status_label.setText(
+                f'下载中: 图片 {self.processed_images}/{self.planned_images} '
+                f'({self.success_image_count}成/{self.failed_image_count}失/{self.skipped_image_count}跳)'
+            )
 
     
     def init_ui(self):
@@ -492,9 +503,9 @@ class MangaDownloaderWindow(FluentWindow):
         thread_row.addWidget(self.threads_value_label, 0)
         dl_layout.addLayout(thread_row)
         
-        note = QLabel('⚠ 过多线程可能被封IP，建议5-20')
-        note.setStyleSheet('color: #FF9800; font-size: 12px; margin-left: 130px;')
-        dl_layout.addWidget(note)
+        self.note = QLabel('⚠ 过多线程可能被封IP，建议5-20')
+        self.note.setStyleSheet('color: #FF9800; font-size: 12px; margin-left: 130px;')
+        dl_layout.addWidget(self.note)
         
         # 重试次数
         retry_row = self._create_setting_row('重试次数:', 120)
@@ -519,6 +530,31 @@ class MangaDownloaderWindow(FluentWindow):
         delay_row.addWidget(self.delay_spin, 0)
         delay_row.addStretch()
         dl_layout.addLayout(delay_row)
+
+        # 请求超时
+        timeout_row = self._create_setting_row('请求超时:', 120)
+        self.timeout_spin = QSpinBox()
+        self.timeout_spin.setMinimum(3)
+        self.timeout_spin.setMaximum(120)
+        self.timeout_spin.setValue(15)
+        self.timeout_spin.setMaximumWidth(100)
+        self.timeout_spin.setMinimumHeight(32)
+        timeout_row.addWidget(self.timeout_spin, 0)
+        timeout_row.addWidget(QLabel('秒'), 0)
+        timeout_row.addStretch()
+        dl_layout.addLayout(timeout_row)
+
+        # 输出格式
+        format_row = self._create_setting_row('输出格式:', 120)
+        self.output_format_combo = QComboBox()
+        self.output_format_combo.addItem('章节文件夹（默认）', 'folder')
+        self.output_format_combo.addItem('ZIP 压缩包', 'zip')
+        self.output_format_combo.addItem('CBZ 漫画包', 'cbz')
+        self.output_format_combo.setMinimumHeight(32)
+        self.output_format_combo.setMaximumWidth(220)
+        format_row.addWidget(self.output_format_combo, 0)
+        format_row.addStretch()
+        dl_layout.addLayout(format_row)
         
         # 下载目录
         dir_row = self._create_setting_row('下载目录:', 120)
@@ -571,35 +607,6 @@ class MangaDownloaderWindow(FluentWindow):
         ui_layout.addLayout(font_row)
         
         scroll_layout.addWidget(ui_card)
-        
-        # ===== 账户设置 =====
-        account_card = SimpleCardWidget()
-        acc_layout = QVBoxLayout(account_card)
-        acc_layout.setContentsMargins(20, 20, 20, 20)
-        acc_layout.setSpacing(18)
-        
-        acc_title = QLabel('账户设置（可选）')
-        acc_title.setObjectName('acc_title')
-        acc_layout.addWidget(acc_title)
-        
-        # 用户名
-        username_row = self._create_setting_row('用户名:', 120)
-        self.username_input = LineEdit()
-        self.username_input.setPlaceholderText('用户名')
-        self.username_input.setMinimumHeight(32)
-        username_row.addWidget(self.username_input, 1)
-        acc_layout.addLayout(username_row)
-        
-        # 密码
-        password_row = self._create_setting_row('密码:', 120)
-        self.password_input = LineEdit()
-        self.password_input.setPlaceholderText('密码')
-        self.password_input.setEchoMode(LineEdit.Password)
-        self.password_input.setMinimumHeight(32)
-        password_row.addWidget(self.password_input, 1)
-        acc_layout.addLayout(password_row)
-        
-        scroll_layout.addWidget(account_card)
         
         # ===== 历史管理 =====
         history_card = SimpleCardWidget()
@@ -722,12 +729,16 @@ class MangaDownloaderWindow(FluentWindow):
         download_dir = self.config.get_download_dir()
         if not Path(download_dir).exists():
             Path(download_dir).mkdir(parents=True, exist_ok=True)
+
+        self._reset_image_progress_counters()
         
         self.downloader = MangaDownloader(
             threads=self.config.get_download_threads(),
             retries=self.config.get_retries(),
             retry_delay=self.config.get_retry_delay(),
-            verify_images=self.config.get_verify_images()
+            timeout=self.config.get_timeout(),
+            verify_images=self.config.get_verify_images(),
+            output_format=self.config.get_output_format()
         )
         
         self.download_thread = DownloadThread(
@@ -746,7 +757,9 @@ class MangaDownloaderWindow(FluentWindow):
         self.parse_btn.setEnabled(False)
         self.progress_bar.setValue(0)
         
+        format_text = self.output_format_combo.currentText() if hasattr(self, 'output_format_combo') else '章节文件夹（默认）'
         self.log(f'\n▶ 开始下载 {len(selected_chapters)} 个章节...')
+        self.log(f'  输出格式: {format_text}')
         self.download_thread.start()
     
     def cancel_download(self):
@@ -758,26 +771,59 @@ class MangaDownloaderWindow(FluentWindow):
     def on_download_progress(self, status: str, url: str, detail: str):
         """下载进度更新"""
         file_hint = Path(url).name if url else ''
+        if status == 'success':
+            self.success_image_count += 1
+            self.processed_images += 1
+            self._update_image_progress_bar()
+            return
+
+        if status == 'skipped':
+            self.skipped_image_count += 1
+            self.processed_images += 1
+            self._update_image_progress_bar()
+            return
+
         if status == 'retry':
             self.log(f'↻ 重试: {file_hint} - {detail}')
-        elif status == 'http_error':
+            return
+
+        if status == 'http_error':
+            self.failed_image_count += 1
+            self.processed_images += 1
             self.log(f'✗ HTTP错误: {file_hint} - {detail}')
-        elif status == 'error':
+            self._update_image_progress_bar()
+            return
+
+        if status == 'error':
+            self.failed_image_count += 1
+            self.processed_images += 1
             self.log(f'✗ 下载异常: {file_hint} - {detail}')
-        elif status == 'not_found':
+            self._update_image_progress_bar()
+            return
+
+        if status == 'not_found':
+            self.failed_image_count += 1
+            self.processed_images += 1
             self.log(f'✗ 图片不存在: {file_hint}')
-        elif status == 'cancelled':
+            self._update_image_progress_bar()
+            return
+
+        if status == 'cancelled':
             self.log('⏹ 当前图片下载已取消')
     
     def on_chapter_progress(self, status: str, current: int, total: int,
                            name: str, stats: dict):
         """章节进度更新"""
-        progress = int((current / total) * 100)
-        self.progress_bar.setValue(progress)
-        
         if status == 'start':
             self.status_label.setText(f'正在下载: {name} ({current}/{total})')
             self.log(f'[{current}/{total}] ⬇ {name}')
+
+        elif status == 'images_total':
+            chapter_images = int(stats.get('chapter_images', 0))
+            planned_images = int(stats.get('planned_images', self.planned_images))
+            self.planned_images = max(self.planned_images, planned_images)
+            self.log(f'[{current}/{total}] · 本章图片: {chapter_images}，累计计划: {self.planned_images}')
+            self._update_image_progress_bar()
         
         elif status == 'complete':
             success = stats.get('success', 0)
@@ -809,9 +855,21 @@ class MangaDownloaderWindow(FluentWindow):
         total_chapters = stats.get('total_chapters', 0)
         success_images = stats.get('success_images', 0)
         failed_images = stats.get('failed_images', 0)
+        skipped_images = stats.get('skipped_images', 0)
+
+        self.success_image_count = success_images
+        self.failed_image_count = failed_images
+        self.skipped_image_count = skipped_images
+        self.processed_images = success_images + failed_images + skipped_images
+        self.planned_images = max(
+            self.planned_images,
+            int(stats.get('planned_images', 0)),
+            int(stats.get('total_images', 0))
+        )
 
         if stats.get('cancelled'):
             cancelled_chapter = stats.get('cancelled_chapter') or '未知章节'
+            self._update_image_progress_bar()
             self.log('\n⏹ 下载已取消')
             self.log(f'  取消位置: {cancelled_chapter}')
             self.log(f'  章节: {success_chapters}/{total_chapters}')
@@ -902,11 +960,11 @@ class MangaDownloaderWindow(FluentWindow):
     
     def save_settings(self):
         """保存设置"""
-        self.config.set_username(self.username_input.text())
-        self.config.set_password(self.password_input.text())
         self.config.set_download_threads(self.threads_slider.value())
         self.config.set_retries(self.retry_spin.value())
         self.config.set_retry_delay(self.delay_spin.value())
+        self.config.set_timeout(self.timeout_spin.value())
+        self.config.set_output_format(self.output_format_combo.currentData())
         self.config.set_download_dir(self.download_dir_input.text())
         self.config.set_verify_images(self.verify_images_checkbox.isChecked())
         
@@ -915,11 +973,15 @@ class MangaDownloaderWindow(FluentWindow):
     
     def load_config(self):
         """加载配置"""
-        self.username_input.setText(self.config.get_username())
-        self.password_input.setText(self.config.get_password())
         self.threads_slider.setValue(self.config.get_download_threads())
         self.retry_spin.setValue(self.config.get_retries())
         self.delay_spin.setValue(self.config.get_retry_delay())
+        self.timeout_spin.setValue(self.config.get_timeout())
+        output_format = self.config.get_output_format()
+        output_idx = self.output_format_combo.findData(output_format)
+        if output_idx < 0:
+            output_idx = 0
+        self.output_format_combo.setCurrentIndex(output_idx)
         self.download_dir_input.setText(self.config.get_download_dir())
         self.verify_images_checkbox.setChecked(self.config.get_verify_images())
         
