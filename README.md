@@ -48,7 +48,8 @@ pip install -r requirements.txt
 运行GUI程序，有两种方式：
 
 **方式1：双击启动脚本（推荐）**
-- Windows用户可直接双击 `启动下载器_Fluent.bat` 文件启动
+- Windows用户可直接双击 `启动下载器_Fluent.bat` 文件启动（默认无控制台窗口）
+- 如需查看报错信息，使用 `启动下载器_Fluent_调试.bat`
 
 **方式2：命令行启动**
 ```bash
@@ -96,6 +97,7 @@ zero-manga-downloader/
 ├── history_manager.py         # 历史记录管理
 ├── install_requirements.bat    # 依赖安装脚本（首次运行）
 ├── 启动下载器_Fluent.bat      # Windows启动脚本
+├── 启动下载器_Fluent_调试.bat # Windows调试启动脚本（保留控制台）
 ├── requirements.txt           # 依赖包列表
 ├── 使用指南.md               # 详细使用教程
 └── README.md                  # 本文件
