@@ -561,13 +561,16 @@ class MangaDownloader:
             'failed_images': 0,
             'skipped_images': 0,
             'cancelled': False,
-            'cancelled_chapter': ''
+            'cancelled_chapter': '',
+            'elapsed_ms': 0
         }
         
         # 重置取消标志和统计
         self.cancelled = False
         self.stats = {'total': 0, 'downloaded': 0, 'failed': 0, 'skipped': 0}
         
+        started_at = time.time()
+
         for idx, chapter_idx in enumerate(chapters_to_download, 1):
             if self.cancelled:
                 total_stats['cancelled'] = True
@@ -586,7 +589,13 @@ class MangaDownloader:
             total_stats['processed_chapters'] += 1
             
             if chapter_callback:
-                chapter_callback('start', idx, len(chapters_to_download), chapter_title, {})
+                chapter_callback(
+                    'start',
+                    idx,
+                    len(chapters_to_download),
+                    chapter_title,
+                    {'phase': 'downloading'}
+                )
 
             if chapter_archive_path and self._is_existing_archive_usable(chapter_archive_path):
                 if chapter_callback:
@@ -608,6 +617,7 @@ class MangaDownloader:
                             'skipped': 1,
                             'total': 1,
                             'cancelled': False,
+                            'phase': 'completed',
                             'archive_path': str(chapter_archive_path)
                         }
                     )
@@ -628,7 +638,7 @@ class MangaDownloader:
                         idx,
                         len(chapters_to_download),
                         chapter_title,
-                        {'message': '正在探测VIP图片...'}
+                        {'message': '正在探测VIP图片...', 'phase': 'probing'}
                     )
                 images = parser.get_chapter_images(
                     manga_id,
@@ -652,14 +662,25 @@ class MangaDownloader:
                 total_stats['cancelled'] = True
                 total_stats['cancelled_chapter'] = chapter_title
                 if chapter_callback:
-                    chapter_callback('cancelled', idx, len(chapters_to_download), chapter_title, {})
+                    chapter_callback(
+                        'cancelled',
+                        idx,
+                        len(chapters_to_download),
+                        chapter_title,
+                        {'phase': 'cancelled'}
+                    )
                 break
             
             if not images:
                 total_stats['failed_chapters'] += 1
                 if chapter_callback:
-                    chapter_callback('failed', idx, len(chapters_to_download), 
-                                   chapter_title, {'error': '无法获取图片'})
+                    chapter_callback(
+                        'failed',
+                        idx,
+                        len(chapters_to_download),
+                        chapter_title,
+                        {'error': '无法获取图片', 'phase': 'failed'}
+                    )
                 continue
 
             total_stats['planned_images'] += len(images)
@@ -671,7 +692,8 @@ class MangaDownloader:
                     chapter_title,
                     {
                         'chapter_images': len(images),
-                        'planned_images': total_stats['planned_images']
+                        'planned_images': total_stats['planned_images'],
+                        'phase': 'downloading'
                     }
                 )
             
@@ -698,7 +720,10 @@ class MangaDownloader:
                             idx,
                             len(chapters_to_download),
                             chapter_title,
-                            {'message': f'章节已打包: {chapter_archive_path.name}'}
+                            {
+                                'message': f'章节已打包: {chapter_archive_path.name}',
+                                'phase': 'packaging'
+                            }
                         )
                 else:
                     chapter_stats['package_failed'] = True
@@ -714,6 +739,7 @@ class MangaDownloader:
                 total_stats['cancelled'] = True
                 total_stats['cancelled_chapter'] = chapter_title
                 if chapter_callback:
+                    chapter_stats['phase'] = 'cancelled'
                     chapter_callback('cancelled', idx, len(chapters_to_download), chapter_title, chapter_stats)
                 break
 
@@ -725,7 +751,7 @@ class MangaDownloader:
                         idx,
                         len(chapters_to_download),
                         chapter_title,
-                        {'error': chapter_stats.get('error', '章节打包失败')}
+                        {'error': chapter_stats.get('error', '章节打包失败'), 'phase': 'failed'}
                     )
                 continue
             
@@ -735,9 +761,11 @@ class MangaDownloader:
                 total_stats['failed_chapters'] += 1
             
             if chapter_callback:
+                chapter_stats['phase'] = 'completed'
                 chapter_callback('complete', idx, len(chapters_to_download), 
                                chapter_title, chapter_stats)
         
+        total_stats['elapsed_ms'] = int((time.time() - started_at) * 1000)
         return total_stats
     
     def cancel(self):
